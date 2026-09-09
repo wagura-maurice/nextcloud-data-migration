@@ -406,6 +406,66 @@ def phase_db(old_client, new_client, dry_run=False):
         print(f"    Would use plain INSERT (not INSERT IGNORE) for truncated tables")
         return True
 
+    # --- Column-order audit: detect schema mismatches before importing ---
+    # Positional INSERTs (without --complete-insert) silently map values to
+    # wrong columns when source and destination have different column orders.
+    # See docs/positional-import-corruption.md for the incident this caused.
+    print("\n  --- Column-order audit ---")
+    audit_mismatches = []
+    for table in tables_both:
+        old_cols_out, _, _ = run(
+            old_client,
+            f"mysql -u {old_db['db_user']} -p'{old_db['db_pass']}' -h {old_db['db_host']} "
+            f"{old_db['db_name']} -N -e \"SHOW COLUMNS FROM {table};\" 2>/dev/null",
+            quiet=True,
+        )
+        new_cols_out, _, _ = run(
+            new_client,
+            f"mysql -u {new_db['db_user']} -p'{new_db['db_pass']}' -h {new_db['db_host']} "
+            f"{new_db['db_name']} -N -e \"SHOW COLUMNS FROM {table};\" 2>/dev/null",
+            quiet=True,
+        )
+        old_col_names = [ln.split("\t")[0] for ln in old_cols_out.split("\n") if ln.strip()]
+        new_col_names = [ln.split("\t")[0] for ln in new_cols_out.split("\n") if ln.strip()]
+        if old_col_names != new_col_names:
+            missing_in_new = set(old_col_names) - set(new_col_names)
+            missing_in_old = set(new_col_names) - set(old_col_names)
+            if missing_in_new or missing_in_old:
+                # Different column sets — app version mismatch, not just ordering
+                audit_mismatches.append({
+                    "table": table,
+                    "type": "column_set",
+                    "missing_in_new": missing_in_new,
+                    "missing_in_old": missing_in_old,
+                })
+            else:
+                # Same columns, different order — --complete-insert handles this
+                audit_mismatches.append({
+                    "table": table,
+                    "type": "column_order",
+                    "old_order": old_col_names,
+                    "new_order": new_col_names,
+                })
+
+    order_mismatches = [m for m in audit_mismatches if m["type"] == "column_order"]
+    set_mismatches = [m for m in audit_mismatches if m["type"] == "column_set"]
+    if order_mismatches:
+        print(f"  Found {len(order_mismatches)} tables with different column ordering")
+        print(f"  (safe with --complete-insert, but logged for awareness)")
+        for m in order_mismatches[:10]:
+            print(f"    {m['table']}: {len(m['old_order'])} cols, order differs")
+    if set_mismatches:
+        print(f"  WARNING: {len(set_mismatches)} tables with different column sets!")
+        for m in set_mismatches:
+            print(f"    {m['table']}:")
+            if m["missing_in_new"]:
+                print(f"      missing in new: {m['missing_in_new']}")
+            if m["missing_in_old"]:
+                print(f"      missing in old: {m['missing_in_old']}")
+        print(f"  Run occ db:add-missing-columns on the new server before importing.")
+    if not audit_mismatches:
+        print(f"  All {len(tables_both)} shared tables have matching column schemas.")
+
     # --- Pre-import cleanup: delete throwaway 'support' user and truncate data tables ---
     # This prevents ID collisions between old and new server data
     # (see docs/collision-analysis.md for full analysis)
@@ -479,18 +539,25 @@ def phase_db(old_client, new_client, dry_run=False):
         print(f"\n  [{table}] Dumping {old_count} rows from old server...")
 
         if exists_on_new:
-            # Data only — new server already has the schema
+            # Data only — new server already has the schema.
+            # --complete-insert generates explicit column lists in INSERT
+            # statements, preventing silent column shifts when source and
+            # destination schemas have different column ordering.
+            # See docs/positional-import-corruption.md for details.
             dump_cmd = (
-                f"mysqldump --no-create-info --skip-add-locks --skip-disable-keys "
+                f"mysqldump --no-create-info --complete-insert "
+                f"--skip-add-locks --skip-disable-keys "
                 f"--skip-triggers --default-character-set=utf8mb4 "
                 f"--single-transaction "
                 f"-u {old_db['db_user']} -p'{old_db['db_pass']}' -h {old_db['db_host']} "
                 f"{old_db['db_name']} {table} 2>/dev/null"
             )
         else:
-            # Schema + data — table doesn't exist on new server
+            # Schema + data — table doesn't exist on new server.
+            # Still use --complete-insert for data safety.
             dump_cmd = (
-                f"mysqldump --default-character-set=utf8mb4 --single-transaction "
+                f"mysqldump --complete-insert --default-character-set=utf8mb4 "
+                f"--single-transaction "
                 f"-u {old_db['db_user']} -p'{old_db['db_pass']}' -h {old_db['db_host']} "
                 f"{old_db['db_name']} {table} 2>/dev/null"
             )
