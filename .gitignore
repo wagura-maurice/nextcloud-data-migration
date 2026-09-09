@@ -1,0 +1,21 @@
+# Sensitive files
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+
+# Backups
+*.sql
+*.bak
+backups/
