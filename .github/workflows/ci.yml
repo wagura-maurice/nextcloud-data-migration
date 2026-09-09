@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-quality:
+    name: Python Syntax & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pyflakes
+
+      - name: Syntax check all Python files
+        run: |
+          for f in migrate.py prereqs.py sweep_test.py; do
+            echo "Checking $f..."
+            python -m py_compile "$f"
+          done
+
+      - name: Flake8 lint
+        run: |
+          flake8 migrate.py prereqs.py sweep_test.py \
+            --max-line-length=120 \
+            --extend-ignore=E501,W503,E402,F401,F841 \
+            --count --statistics
+
+  security-scan:
+    name: Credential Leak Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for hardcoded credentials
+        run: |
+          echo "Scanning for leaked credentials..."
+          FOUND=0
+
+          # Check for known credential patterns (exclude .github/ which contains the scanner itself)
+          for pattern in "passw@rd" "29658002aa0578" "Qwerty123"; do
+            if grep -rn "$pattern" . --include="*.py" --include="*.md" --include="*.json" --exclude-dir=".git" --exclude-dir=".github" --exclude=".env"; then
+              echo "ERROR: Found hardcoded credential: $pattern"
+              FOUND=1
+            fi
+          done
+
+          # Check for common secret patterns (long hex/base64 strings in quotes)
+          if grep -rnP "(password|secret|token)['\"]?\s*[:=]\s*['\"][a-zA-Z0-9+/=]{20,}['\"]" \
+            . --include="*.py" --include="*.json" --exclude-dir=".git" --exclude-dir=".github" --exclude=".env"; then
+            echo "ERROR: Found potential hardcoded secret"
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "::error::Hardcoded credentials detected in tracked files"
+            exit 1
+          fi
+
+          echo "No hardcoded credentials found."
+
+      - name: Verify .env is not tracked
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env file is tracked by git!"
+            exit 1
+          fi
+          echo ".env is correctly gitignored."
+
+      - name: Verify .gitignore exists and covers .env
+        run: |
+          if [ ! -f .gitignore ]; then
+            echo "::error::.gitignore not found"
+            exit 1
+          fi
+          if ! grep -q "^\.env$" .gitignore; then
+            echo "::error::.env not in .gitignore"
+            exit 1
+          fi
+          echo ".gitignore correctly excludes .env."
+
+  docs-check:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check all referenced docs exist
+        run: |
+          MISSING=0
+          for doc in docs/manual-phases.md docs/final-sweep-report.md docs/final-sweep-report-v2.md \
+                     docs/collision-analysis.md docs/encrypted-credentials.md docs/caveats.md \
+                     docs/00-overview.md docs/01-pre-migration-investigation.md; do
+            if [ ! -f "$doc" ]; then
+              echo "::error::Missing doc: $doc"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            exit 1
+          fi
+          echo "All referenced docs exist."
+
+      - name: Check .env.example matches .env keys
+        run: |
+          if [ ! -f .env.example ]; then
+            echo "::error::.env.example not found"
+            exit 1
+          fi
+          # Extract keys from .env.example
+          KEYS=$(grep -oP '^[A-Z_]+(?==)' .env.example | sort)
+          EXPECTED="NEW_SERVER_DB_HOST
+          NEW_SERVER_DB_NAME
+          NEW_SERVER_DB_PASS
+          NEW_SERVER_DB_USER
+          NEW_SERVER_DATADIR
+          NEW_SERVER_HOST
+          NEW_SERVER_INSTANCEID
+          NEW_SERVER_NGINX_CONF
+          NEW_SERVER_PHP_FPM_SERVICE
+          NEW_SERVER_PORT
+          NEW_SERVER_SSH_PASS
+          NEW_SERVER_USER
+          NEW_SERVER_WEB_USER
+          NEW_SERVER_WEBROOT
+          OLD_SERVER_DB_HOST
+          OLD_SERVER_DB_NAME
+          OLD_SERVER_DB_PASS
+          OLD_SERVER_DB_USER
+          OLD_SERVER_DATADIR
+          OLD_SERVER_HOST
+          OLD_SERVER_INSTANCEID
+          OLD_SERVER_PORT
+          OLD_SERVER_USER
+          OLD_SERVER_WEB_USER
+          OLD_SERVER_WEBROOT"
+          MISSING=$(comm -23 <(echo "$EXPECTED" | sort) <(echo "$KEYS"))
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing keys in .env.example:"
+            echo "$MISSING"
+            exit 1
+          fi
+          echo "All expected keys present in .env.example."
+
+  dry-run-validation:
+    name: Dry-Run Script Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install paramiko
+        run: |
+          python -m pip install --upgrade pip
+          pip install paramiko
+
+      - name: Validate migrate.py --help works
+        run: |
+          python migrate.py --help
+
+      - name: Validate prereqs.py --help works
+        run: |
+          python prereqs.py --help
+
+      - name: Validate .env.example is parseable
+        run: |
+          python -c "
+          from pathlib import Path
+          env = {}
+          with open('.env.example') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#') and '=' in line:
+                      key, _, value = line.partition('=')
+                      env[key.strip()] = value.strip()
+          print(f'Parsed {len(env)} env vars from .env.example')
+          assert len(env) >= 20, f'Expected at least 20 vars, got {len(env)}'
+          print('All env vars parsed correctly.')
+          "
