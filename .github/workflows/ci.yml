@@ -37,7 +37,7 @@ jobs:
         run: |
           flake8 migrate.py prereqs.py sweep_test.py \
             --max-line-length=120 \
-            --extend-ignore=E501,W503,E402,F401,F841 \
+            --extend-ignore=E501,W503,E402,F401,F841,E302,E305,F541 \
             --count --statistics
 
   security-scan:

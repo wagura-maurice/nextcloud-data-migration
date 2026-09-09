@@ -85,7 +85,7 @@ SKIP_TABLES = {
     "oc_jobs",              # background job queue
     "oc_migrations",        # migration tracking
     "oc_recent_contacts",   # auto-generated
-    "oc_addressbookchanges", # auto-generated sync table
+    "oc_addressbookchanges",  # auto-generated sync table
     "oc_calendarchanges",   # auto-generated sync table
     "oc_cards_properties",  # will be rebuilt by occ maintenance:repair
     "oc_systemtag",         # system tags (keep new server's)
@@ -624,7 +624,7 @@ def phase_db(old_client, new_client, dry_run=False):
 # PHASE 6: STORAGE PATH REWRITE
 # ============================================================================
 
-def phase_storage(new_client, dry_run=False):
+def phase_storage(old_client, new_client, dry_run=False):
     """Rewrite oc_storages paths on the new server to point at the new data dir."""
     print("\n" + "=" * 70)
     print("PHASE 6: STORAGE PATH REWRITE")
@@ -761,7 +761,7 @@ if ($errors > 0) {
     if dry_run:
         print("    [DRY RUN] Would re-encrypt 20 mail account passwords")
         print("    (decrypt with old secret, re-encrypt with new secret)")
-        print("    Uses Nextcloud's OC\Security\Crypto via lib/base.php bootstrap")
+        print(r"    Uses Nextcloud's OC\Security\Crypto via lib/base.php bootstrap")
         return True
 
     # Write the PHP script to the new server
@@ -771,9 +771,11 @@ if ($errors > 0) {
     sftp.close()
 
     # Get the old server's secret
-    old_secret_out, _, _ = run(old_client,
+    old_secret_out, _, _ = run(
+        old_client,
         f"grep -oP \"\\'secret\\' => '\\K[^']*'\" {OLD_SERVER['webroot']}/config/config.php",
-        "get old secret", quiet=True)
+        "get old secret", quiet=True,
+    )
     old_secret = old_secret_out.strip()
 
     if not old_secret:
@@ -835,7 +837,7 @@ def main():
         success = phase_db(old_client, new_client, dry_run=args.dry_run) and success
 
     if args.phase in ("storage", "all"):
-        success = phase_storage(new_client, dry_run=args.dry_run) and success
+        success = phase_storage(old_client, new_client, dry_run=args.dry_run) and success
 
     print("\n" + "=" * 70)
     print(f"MIGRATION {'COMPLETE' if success else 'COMPLETED WITH ERRORS'}")
