@@ -1,37 +1,66 @@
 # Nextcloud Mail (SMTP) Configuration — Your Tasks
 
-The non-secret SMTP settings have already been configured on the destination
-server. The remaining steps require credentials only you can provide.
+## Investigation findings
 
-## Already configured
+The mail server for all Amaris email operations is **mail.amarissolutions.com**
+(resolves to `144.91.109.222` — a separate VPS from both Nextcloud instances).
+
+### What was found on the destination VPS (164.68.104.123)
+
+| Location | What | Status |
+|----------|------|--------|
+| `oc_mail_accounts` (Nextcloud Mail app) | 20 per-user IMAP/SMTP accounts, all using `mail.amarissolutions.com` | Migrated and re-encrypted — passwords are SET and decrypt correctly |
+| `oc_appconfig` (system-level SMTP) | `mail_smtpmode`, `mail_sendmailmode`, `mail_domain`, `mail_from_address` | Partially configured (non-secret values only) |
+| BT Panel (`stmp_mail.json`, `mail_list.json`) | Panel-level mail config | Both empty `[]` |
+| `/etc/` system mail (postfix, msmtp, ssmtp) | System mail transport | Not installed |
+
+### What was found on the source VPS (38.242.141.240)
+
+| Location | What | Status |
+|----------|------|--------|
+| `config.php` | `mail_smtpmode=smtp`, `mail_sendmailmode=smtp`, `mail_smtpsecure=ssl` | Basic settings only — no host, port, or credentials |
+| `oc_appconfig` | Only `mail_providers_enabled=1` | No SMTP host or credentials were ever configured |
+| System mail software | postfix, dovecot, msmtp | Not installed |
+
+### Conclusion
+
+**No system-level SMTP credentials for `mail.amarissolutions.com` are stored on
+either VPS.** The source server never had a fully configured system-level SMTP.
+The per-user Mail app credentials (IMAP/SMTP passwords) were migrated
+successfully, but the system-level SMTP (for notifications, password resets,
+etc.) needs to be configured from scratch.
+
+The mail server at `144.91.109.222` is not accessible with the SSH credentials
+available for the Nextcloud VPS instances.
+
+---
+
+## Already configured on destination
 
 | Setting | Value |
 |---------|-------|
 | `mail_smtpmode` | `smtp` |
 | `mail_sendmailmode` | `smtp` |
-| `mail_domain` | `amarisstock.com` |
+| `mail_domain` | `amarissolutions.com` |
 | `mail_from_address` | `noreply` |
 
 ## What you need to do
 
-### 1. Gather your SMTP credentials
+### 1. Gather your SMTP credentials for mail.amarissolutions.com
 
-You need the following from your email provider (e.g. your hosting provider,
-Google Workspace, Microsoft 365, etc.):
+You need the following from the mail server administrator or hosting provider
+for `mail.amarissolutions.com` (`144.91.109.222`):
 
-- **SMTP host** (e.g. `smtp.gmail.com`, `smtp.office365.com`)
-- **SMTP port** (typically `465` for SSL, or `587` for STARTTLS)
-- **Encryption type** (`ssl` or `tls`)
-- **SMTP username** (usually the full email address)
-- **SMTP password** (or app-specific password if 2FA is enabled on the mail account)
+- **SMTP host**: `mail.amarissolutions.com`
+- **SMTP port**: likely `465` (SSL) or `587` (STARTTLS) — confirm with your mail admin
+- **Encryption type**: `ssl` or `tls` — confirm with your mail admin
+- **SMTP username**: a mailbox address on the amarissolutions.com domain
+  (e.g. `noreply@amarissolutions.com` or a dedicated account)
+- **SMTP password**: the password for that mailbox
 
 ### 2. Apply the settings in Nextcloud
 
 Log in to **https://cloud.amarisstock.com** as an admin, then go to:
-
-**Profile picture (top right) → Personal settings → Email**
-
-Or configure via the admin panel:
 
 **Settings → Administration → Basic settings → Email server**
 
@@ -43,8 +72,8 @@ Alternatively, run these commands on the destination server
 ```bash
 cd /www/wwwroot/cloud.amarisstock.com
 
-sudo -u www php occ config:app:set core mail_smtphost --value="<SMTP_HOST>"
-sudo -u www php occ config:app:set core mail_smtpport --value="<SMTP_PORT>"
+sudo -u www php occ config:app:set core mail_smtphost --value="mail.amarissolutions.com"
+sudo -u www php occ config:app:set core mail_smtpport --value="<465_or_587>"
 sudo -u www php occ config:app:set core mail_smtpsecure --value="<ssl_or_tls>"
 sudo -u www php occ config:app:set core mail_smtpauth --value=1
 sudo -u www php occ config:app:set core mail_smtpname --value="<SMTP_USERNAME>"
@@ -60,11 +89,11 @@ Or via CLI:
 
 ```bash
 cd /www/wwwroot/cloud.amarisstock.com
-sudo -u www php occ user:setting <your_admin_username> settings email <your_email@example.com>
+sudo -u www php occ user:setting <your_admin_username> settings email <your_email@amarissolutions.com>
 sudo -u www php occ test:mail <your_admin_username>
 ```
 
-Check the inbox for the test message from `noreply@amarisstock.com`.
+Check the inbox for the test message from `noreply@amarissolutions.com`.
 
 ### 4. Verify
 
@@ -87,5 +116,5 @@ sudo -u www php occ setupchecks
 - Do **not** commit SMTP credentials to the repository.
 - The `mail_smtppassword` is stored encrypted in the Nextcloud database
   (`oc_appconfig`), not in `config.php`.
-- If your email provider supports app-specific passwords (e.g. Gmail), use one
-  instead of your main account password.
+- If your mail server supports app-specific passwords, use one instead of a
+  main account password.
