@@ -292,25 +292,29 @@ def phase_apps(old_client, new_client, dry_run=False):
             # Check if app exists on old server
             _, _, check_code = run(old_client, f"test -d {old_app_path} && echo EXISTS", quiet=True)
             if check_code == 0:
-                # Tar the app on old server, pull, push, untar on new
-                run(old_client, f"cd {OLD_SERVER['webroot']}/apps && tar czf /tmp/app_{app}.tar.gz {app}", quiet=True)
-                sftp_old = old_client.open_sftp()
-                sftp_old.get(f"/tmp/app_{app}.tar.gz", f"/tmp/app_{app}.tar.gz")
-                sftp_old.close()
-                run(old_client, f"rm -f /tmp/app_{app}.tar.gz", quiet=True)
-                sftp_new = new_client.open_sftp()
-                sftp_new.put(f"/tmp/app_{app}.tar.gz", f"/tmp/app_{app}.tar.gz")
-                sftp_new.close()
-                os.remove(f"/tmp/app_{app}.tar.gz")
-                run(new_client, f"cd {NEW_SERVER['webroot']}/apps && tar xzf /tmp/app_{app}.tar.gz && rm /tmp/app_{app}.tar.gz", quiet=True)
-                run(new_client, f"chown -R {NEW_SERVER['web_user']}:{NEW_SERVER['web_user']} {new_app_path}", quiet=True)
-                _, _, enable_code = run(new_client, f"{NEW_SERVER['occ']} app:enable {app}", f"enable {app} (manual)", timeout=60)
-                if enable_code == 0:
-                    installed.append(app)
-                    print(f"    OK: {app} copied from old server and enabled")
-                else:
+                try:
+                    # Tar the app on old server, pull, push, untar on new
+                    run(old_client, f"cd {OLD_SERVER['webroot']}/apps && tar czf /tmp/app_{app}.tar.gz {app}", quiet=True)
+                    sftp_old = old_client.open_sftp()
+                    sftp_old.get(f"/tmp/app_{app}.tar.gz", f"/tmp/app_{app}.tar.gz")
+                    sftp_old.close()
+                    run(old_client, f"rm -f /tmp/app_{app}.tar.gz", quiet=True)
+                    sftp_new = new_client.open_sftp()
+                    sftp_new.put(f"/tmp/app_{app}.tar.gz", f"/tmp/app_{app}.tar.gz")
+                    sftp_new.close()
+                    os.remove(f"/tmp/app_{app}.tar.gz")
+                    run(new_client, f"cd {NEW_SERVER['webroot']}/apps && tar xzf /tmp/app_{app}.tar.gz && rm -f /tmp/app_{app}.tar.gz", quiet=True)
+                    run(new_client, f"chown -R {NEW_SERVER['web_user']}:{NEW_SERVER['web_user']} {new_app_path}", quiet=True)
+                    _, _, enable_code = run(new_client, f"{NEW_SERVER['occ']} app:enable {app}", f"enable {app} (manual)", timeout=60)
+                    if enable_code == 0:
+                        installed.append(app)
+                        print(f"    OK: {app} copied from old server and enabled")
+                    else:
+                        failed.append(app)
+                        print(f"    FAIL: {app} copied but could not enable — check app compatibility")
+                except Exception as copy_err:
                     failed.append(app)
-                    print(f"    FAIL: {app} copied but could not enable — check app compatibility")
+                    print(f"    FAIL: {app} manual copy failed — {copy_err}")
             else:
                 failed.append(app)
                 print(f"    FAIL: {app} not found on old server apps/ either — skipping")
@@ -431,6 +435,7 @@ def phase_db(old_client, new_client, dry_run=False):
     migrated = []
     skipped = []
     errors = []
+    failed_tables = []
 
     # Order: core tables first (respecting FK dependencies), then app tables
     migration_order = [
@@ -470,7 +475,7 @@ def phase_db(old_client, new_client, dry_run=False):
 
         exists_on_new = table in new_tables
 
-        # Step 1: Dump from old server
+        # Step 1: Dump from old server — capture stdout directly via SSH
         print(f"\n  [{table}] Dumping {old_count} rows from old server...")
 
         if exists_on_new:
@@ -490,26 +495,39 @@ def phase_db(old_client, new_client, dry_run=False):
                 f"{old_db['db_name']} {table} 2>/dev/null"
             )
 
-        # Dump to file on old server
-        old_dump_path = f"/tmp/migrate_{table}.sql"
-        run(old_client, f"{dump_cmd} > {old_dump_path}", f"dump {table}", quiet=True)
+        # Run dump and capture stdout directly (no file redirection on old server)
+        stdin, stdout, stderr = old_client.exec_command(dump_cmd, timeout=300)
+        dump_data = stdout.read()
+        dump_err = stderr.read().decode("utf-8", errors="replace").strip()
+        dump_code = stdout.channel.recv_exit_status()
 
-        # Step 2: SFTP pull to local
-        sftp_old = old_client.open_sftp()
+        if dump_code != 0 or len(dump_data) == 0:
+            print(f"    ERROR: dump failed for {table} (exit {dump_code}, {len(dump_data)} bytes): {dump_err[:200]}")
+            failed_tables.append(table)
+            continue
+
+        # Write dump to local temp file
         local_path = f"/tmp/migrate_{table}.sql"
-        sftp_old.get(old_dump_path, local_path)
-        sftp_old.close()
-        file_size = os.path.getsize(local_path)
+        with open(local_path, "wb") as f:
+            f.write(dump_data)
+        file_size = len(dump_data)
 
-        # Step 3: SFTP push to new server
-        sftp_new = new_client.open_sftp()
-        new_dump_path = f"/tmp/migrate_{table}.sql"
-        sftp_new.put(local_path, new_dump_path)
-        sftp_new.close()
+        # Step 2: SFTP push to new server
+        try:
+            sftp_new = new_client.open_sftp()
+            new_dump_path = f"/tmp/migrate_{table}.sql"
+            sftp_new.put(local_path, new_dump_path)
+            sftp_new.close()
+        except Exception as sftp_err:
+            print(f"    ERROR: SFTP upload failed for {table}: {sftp_err}")
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            failed_tables.append(table)
+            continue
 
-        # Clean up temp files
-        run(old_client, f"rm -f {old_dump_path}", quiet=True)
-        os.remove(local_path)
+        # Clean up local temp file
+        if os.path.exists(local_path):
+            os.remove(local_path)
 
         # Step 4: Import on new server
         print(f"  [{table}] Importing {file_size} bytes to new server...")
@@ -644,7 +662,7 @@ def phase_storage(old_client, new_client, dry_run=False):
     db = NEW_SERVER
     show_cmd = (
         f"mysql -u {db['db_user']} -p'{db['db_pass']}' -h {db['db_host']} "
-        f"{db['db_name']} -e \"SELECT id, available, last_scan FROM oc_storages WHERE id LIKE 'local::%' LIMIT 30;\" 2>/dev/null"
+        f"{db['db_name']} -e \"SELECT id, available, last_checked FROM oc_storages WHERE id LIKE 'local::%' LIMIT 30;\" 2>/dev/null"
     )
     run(new_client, show_cmd, "current storages")
 
@@ -773,10 +791,10 @@ if ($errors > 0) {
     # Get the old server's secret
     old_secret_out, _, _ = run(
         old_client,
-        f"grep -oP \"\\'secret\\' => '\\K[^']*'\" {OLD_SERVER['webroot']}/config/config.php",
+        f"grep -oP \"'secret' => '\\K[^']+\" {OLD_SERVER['webroot']}/config/config.php",
         "get old secret", quiet=True,
     )
-    old_secret = old_secret_out.strip()
+    old_secret = old_secret_out.strip().rstrip("'")
 
     if not old_secret:
         print("    ERROR: Could not read old server's secret — skipping re-encryption")
